@@ -1,39 +1,58 @@
 #include "json.h"
+#include "utils.h"
+#include <assert.h>
+#include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 int main(int argc, char **argv) {
   if (argc < 2) {
-    printf("pelase provide argument\n");
+    fprintf(stderr, "pelase provide argument\n");
+    fprintf(stderr, "argument: %s [json file]\n", *argv);
     return 1;
   }
   FILE *f = fopen(argv[1], "rb");
   fseek(f, 0, SEEK_END);
   long fsize = ftell(f);
+  if (fsize == -1) {
+    LOG_ERROR("ftell failed with %s\n", strerror(errno));
+  }
+
   fseek(f, 0, SEEK_SET); /* same as rewind(f); */
 
-  char *json = malloc(fsize + 1);
-  fread(json, fsize, 1, f);
+  char *json = (char *)malloc((size_t)fsize + 1);
+  fread(json, (size_t)fsize, 1, f);
   fclose(f);
   json[fsize] = 0;
 
-  jsonObject *obj = json_object_new(10, 0.75, NULL);
-  jsonObject *new_obj = json_object_new(10, 0.75, NULL);
+  jsonObject obj = {0};
+  jsonStatus ret = json_object_new(&obj, 16, 80, NULL, NULL, NULL);
+  assert(ret == JSON_STATUS_OK);
+  json_from_string(&obj, json, (size_t)fsize, NULL);
+  jsonKeyValuePair *value = json_object_get(&obj, "testing1");
+  jsonArray *array = value->element.as.array;
+  jsonElement *elem = json_array_get(array, 0);
+  LOG_DEBUG("%lf\n", elem->as.number);
+  elem = json_array_get(array, 4);
+  LOG_DEBUG("%s\n", elem->as.string);
 
-  jsonKeyValuePair *kv_pair_child1 = json_key_value_pair_new(
-      "testing2", JSON_ELEMENT_STRING("leeessssgooooo\n"));
-  jsonKeyValuePair *kv_pair_child2 =
-      json_key_value_pair_new("testing3", JSON_ELEMENT_NUMBER(9));
+  elem = json_array_get(array, 5);
+  jsonObject *nested_object = elem->as.object;
+  value = json_object_get(nested_object, "testin2");
+  jsonElement *nested_element = &value->element;
+  LOG_DEBUG("%s\n", nested_element->as.string);
+  value = json_object_get(nested_object, "testing4");
 
-  json_object_append_key_value_pair(new_obj, kv_pair_child1, NULL);
-  json_object_append_key_value_pair(new_obj, kv_pair_child2, NULL);
+  nested_element = &value->element;
+  jsonArray *nested_array = nested_element->as.array;
+  elem = json_array_get(nested_array, 0);
+  LOG_DEBUG("%s\n", elem->as.string);
 
-  jsonKeyValuePair *kv_pair_parent_object = json_key_value_pair_new(
-      "testing1", JSON_ELEMENT_OBJEKT(json_object_clone(new_obj)));
+  elem = json_array_get(array, 6);
+  nested_array = elem->as.array;
 
-  json_object_append_key_value_pair(obj, kv_pair_parent_object, NULL);
-
-  // jsonStatus ret = json_from_string(json, strlen(json), &obj);
-  // if (ret.kind != JSON_OK) {
-  //   fprintf(stderr, "got error while parsing json %d %s\n", ret.kind,
-  //           ret.place);
-  // }
+  elem = json_array_get(nested_array, 0);
+  LOG_DEBUG("%s\n", elem->as.string);
 }

@@ -2,96 +2,174 @@
 #define __JSON_H
 
 #include <assert.h>
-#include <ctype.h>
-#include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/cdefs.h>
 #include <unistd.h>
 
-#define next(iter) iter++
-#define json_parse_key json_parse_string
-#define JSON_ELEMENT_NUMBER(value)  &(jsonElement){.kind =  JSON_KIND_NUMBER, ._int = value}
-#define JSON_ELEMENT_STRING(value)  &(jsonElement){.kind = JSON_KIND_STRING, ._string = value}
-#define JSON_ELEMENT_OBJEKT(value)  &(jsonElement){.kind = JSON_KIND_OBJEKT, ._obj = value}
-#define JSON_STATUS_OK 0
-#define JSON_STATUS_ERROR 1
+#ifndef opaque_ptr_t
+#define opaque_ptr_t void *
+#endif
 
-//not to be confused with jsonParserStatus
-typedef int jsonStatus;
-typedef int64_t hash_t;
-typedef hash_t (*hash_func_t)(char *key, void *user_data);
-typedef struct jsonElement jsonElement;
-typedef struct jsonKeyValuePair jsonKeyValuePair;
-typedef struct jsonObject jsonObject;
-struct jsonObject {
-  // jsonKeyValuePair **list; /* a dynlist that contains pointer in a list
-  // kindof way ig*/
-  jsonKeyValuePair *entries;
-  uint32_t len;
-  uint32_t capacity;
-  float load_factor;
-  hash_func_t hash_func;
-};
+#ifndef J_UNUSED
+#define J_UNUSED(var) (void)var
+#endif
+
+#define J_MALLOC(ctx, ...) malloc(__VA_ARGS__)
+#define J_FREE(ctx, ...) free(__VA_ARGS__)
+#define J_REALLOC(ctx, ...) realloc(__VA_ARGS__)
+#define next(iter) iter++
+#define JSON_ELEMENT_NUMBER(value)                                             \
+  &(jsonElement) { .kind = JSON_KIND_NUMBER, ._int = value }
+#define JSON_ELEMENT_STRING(value)                                             \
+  &(jsonElement) { .kind = JSON_KIND_STRING, ._string = value }
+#define JSON_ELEMENT_OBJEKT(value)                                             \
+  &(jsonElement) { .kind = JSON_KIND_OBJEKT, ._obj = value }
+
+typedef size_t hash_t;
+typedef bool jbool_t;
+
+// todo(shahzad): json supports int of 256 bytes i wanna kms
+typedef double json_number;
+typedef hash_t (*hash_func_t)(const char *key, void *user_data);
 
 typedef enum jsonParserErrorKind {
   JSON_OK,
   JSON_INVALID,
+  JSON_INVALID_ARRAY,
   JSON_INVALID_NUMBER,
   JSON_INVALID_STRING,
   JSON_NO_SEPERATOR,
   JSON_EXHAUSTED,
+  JSON_INTERNAL_FAILURE, // when internal function fails
+  JSON_INTERNAL_OUT_OF_MEMORY,
 } jsonParserErrorKind;
 
-typedef struct _jsonStatus {
+typedef enum {
+  JSON_STATUS_OK,
+  JSON_ERROR_OUT_OF_MEMORY = JSON_INTERNAL_OUT_OF_MEMORY,
+} jsonStatus;
+
+typedef struct {
+  uint32_t column;
+  uint32_t row;
   jsonParserErrorKind kind;
-  char *place;
 } jsonParserStatus;
+
+struct jsonHash {
+
+  hash_func_t hash_func;
+  opaque_ptr_t hash_func_userdata;
+};
+
+struct jsonObject {
+  struct jsonKeyValuePair *entries;
+  size_t n_entries;
+  size_t capacity;
+  struct jsonHash hasher;
+  size_t load_factor;
+};
+
+struct jsonArray {
+  struct jsonElement *elems;
+  size_t len;
+  size_t capacity;
+};
 
 typedef enum _jsonElementKind {
   JSON_KIND_NUMBER,
   JSON_KIND_STRING,
   JSON_KIND_OBJEKT,
+  JSON_KIND_ARRAY,
 } jsonElementKind;
 
 struct jsonElement {
-  jsonElementKind kind;
   union {
-    char *_string;
-    int64_t _int;
-    jsonObject* _obj;
-  };
+    char *string;
+    json_number number; // TODO: make this integer shit big
+    struct jsonObject *object;
+    struct jsonArray *array;
+  } as;
+  jsonElementKind kind;
+  char padding[4];
 };
-typedef struct jsonKeyValuePair {
-  char *key;
-  hash_t hash;  //store the hash cause we are using open addressing
-  jsonElement element;
-  jsonKeyValuePair *next;
-} jsonKeyValuePair;
 
-typedef struct jsonObjectIter {
-  jsonKeyValuePair *current;
-  jsonKeyValuePair *next;
-  jsonKeyValuePair *last;
-}jsonObjectIter;
+struct jsonKeyValuePair {
+  const char *key;
+  hash_t hash;
+  struct jsonElement element;
+};
 
-//well this is basically a hashmap i guess so idk
+struct jsonObjectIter {
+  struct jsonKeyValuePair *first;
+  struct jsonKeyValuePair *current;
+  struct jsonKeyValuePair *last;
+};
 
-char *ltrim(char *str);
-char *rtrim(char *str, char *end);
-jsonObject *json_object_new(int init_cap, float load_factor, hash_func_t hash_func);
-jsonParserStatus json_parse_object(char **json_start, char *json_end,
-                            jsonObject *object);
-jsonParserStatus json_parse_string(char **json_start, char *json_end, char **string);
-jsonParserStatus parse_key(char **str_json, int json_len, char **key);
-jsonParserStatus json_from_string(char *str_json, int json_len, jsonObject *object);
-jsonKeyValuePair *json_key_value_pair_new(char *key, jsonElement *value);
-jsonObjectIter json_object_iter_new(jsonObject *obj);
-const jsonKeyValuePair *json_object_iter_next(jsonObjectIter *iter);
-jsonObject *json_object_clone(jsonObject *j_obj);
+typedef struct jsonObject jsonObject;
+typedef struct jsonArray jsonArray;
+typedef struct jsonObjectIter jsonObjectIter;
+typedef struct jsonKeyValuePair jsonKeyValuePair;
+typedef struct jsonElement jsonElement;
+typedef struct jsonHash jsonHash;
+
+jsonStatus json_object_new(jsonObject *obj, size_t init_cap, size_t load_factor,
+                           hash_func_t hash_func,
+                           opaque_ptr_t hash_func_userdata,
+                           opaque_ptr_t allocator_ctx) __nonnull((1));
+jsonKeyValuePair *json_object_get(jsonObject *object, const char *key) __nonnull((1,2));
 jsonStatus json_object_append_key_value_pair(jsonObject *object,
-                                            jsonKeyValuePair *kv_pair,
-                                            void *user_data);
+                                             const jsonKeyValuePair *kv_pair,
+                                             opaque_ptr_t allocator_ctx)
+    __nonnull((1, 2));
+jsonStatus json_object_resize(jsonObject *obj, size_t new_capacity,
+                              opaque_ptr_t allocator_ctx) __nonnull((1));
+
+bool json_object_is_resize_required(jsonObject *object) __nonnull((1));
+void json_object_free(jsonObject *object) __nonnull((1));
+jsonObjectIter json_object_iter_new(const jsonObject *obj) __nonnull((1));
+const jsonKeyValuePair *json_object_iter_next(jsonObjectIter *iter)
+    __nonnull((1));
+
+jsonParserStatus json_parse_value(jsonElement *json_elem,
+                                  const jsonHash *hash_vtable, char *str_json,
+                                  size_t *json_idx, size_t json_len,
+                                  opaque_ptr_t allocator_ctx);
+jsonParserStatus json_parse_array(jsonArray *array, char *str_json,
+                                  size_t *json_idx, size_t json_len,
+                                  const jsonHash *hash_vtable,
+                                  opaque_ptr_t allocator_ctx);
+jsonParserStatus json_parse_object(jsonObject *object, char *str_json,
+                                   size_t *json_idx, size_t json_len,
+                                   opaque_ptr_t allocator_ctx);
+jsonParserStatus json_from_string(jsonObject *object, char *json_start,
+                                  size_t json_len, opaque_ptr_t allocator_ctx)
+    __nonnull((1,2));
+jsonStatus json_key_value_pair_new(jsonKeyValuePair *pair, char *key,
+                                   jsonElement *value,
+                                   opaque_ptr_t allocator_ctx)
+    __nonnull((1, 2, 3));
+
+jsonStatus json_array_new(struct jsonArray *array, size_t capacity,
+                          opaque_ptr_t allocator_ctx) __nonnull((1));
+
+jsonStatus json_array_append(struct jsonArray *array, struct jsonElement elem,
+                             opaque_ptr_t allocator_ctx) __nonnull((1));
+jsonElement * json_array_get(struct jsonArray *array, size_t idx) __nonnull((1));
+jsonStatus json_array_resize(struct jsonArray *array, size_t new_capacity,
+                             opaque_ptr_t allocator_ctx) __nonnull((1));
+jsonStatus json_array_remove_swap(struct jsonArray *array, size_t idx)
+    __nonnull((1));
+jsonStatus json_array_remove_ordered(struct jsonArray *array, size_t idx)
+    __nonnull((1));
+jsonStatus json_array_free(struct jsonArray *array) __nonnull((1));
+
+jsonStatus json_element_free(jsonElement *element) __nonnull((1));
+
+// jsonObject *json_object_clone(jsonObject *j_obj);
 #endif

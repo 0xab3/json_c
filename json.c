@@ -1,327 +1,674 @@
 #include "json.h"
+#include "utils.h"
 #include <assert.h>
+#include <ctype.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <time.h>
-hash_t typical_hash_function(char *key, void *user_data) {
-  (void)user_data;
-  int64_t hash = 5381;
+#include <sys/cdefs.h>
+#include <uchar.h>
+#include <unistd.h>
+
+#define json_parse_key json_parse_string
+
+static hash_t typical_hash_function(const char *key, void *user_data);
+static void json_object_try_insert_kv_pair(jsonObject *object,
+                                           const jsonKeyValuePair *kv_pair,
+                                           size_t preferred_position);
+static jsonKeyValuePair *json_key_value_pair_get_first(jsonKeyValuePair *start,
+                                                       jsonKeyValuePair *end);
+
+static jsonStatus strndup(opaque_ptr_t allocator_ctx, const char *cstr,
+                          size_t len, char **dest);
+
+// returns what the index would be after trimming
+static size_t ltrim(char *start);
+
+#define cstrdup(ctx, cstr, dest) strndup(ctx, cstr, strlen(cstr), dest)
+
+// leaks stack memory to *heap
+static jsonStatus box(opaque_ptr_t allocator_ctx, opaque_ptr_t source,
+                      opaque_ptr_t *destination, size_t object_size) {
+  J_UNUSED(allocator_ctx);
+  *destination = J_MALLOC(allocator_ctx, object_size);
+  if (destination == NULL) {
+    return JSON_ERROR_OUT_OF_MEMORY;
+  }
+  memcpy(*destination, source, object_size);
+  return JSON_STATUS_OK;
+}
+static hash_t typical_hash_function(const char *key, void *user_data) {
+  J_UNUSED(user_data);
+
+  size_t hash = 5381;
   assert(key != NULL && "bro wtf");
   size_t key_len = strlen(key);
-  for (int i = 0; i < key_len; i++) {
-    hash = ((hash << 5) + hash) + key[i];
+  for (size_t i = 0; i < key_len; i++) {
+    hash = ((hash << 5) + hash) + (size_t)key[i];
   }
   return hash;
 }
-jsonObject *json_object_new(int init_cap, float load_factor,
-                            hash_func_t hash_func) {
-  jsonObject *j_obj = NULL;
+jsonStatus json_object_new(jsonObject *obj, size_t init_cap, size_t load_factor,
+                           hash_func_t hash_func,
+                           opaque_ptr_t hash_func_userdata,
+                           opaque_ptr_t allocator_ctx) {
+  J_UNUSED(allocator_ctx);
+
   if (hash_func == NULL)
     hash_func = typical_hash_function;
+
+  assert(load_factor < 100 && "load factor must be between 0 and 100!");
+
   if (load_factor == 0)
-    load_factor = 0.75;
-  j_obj = malloc(sizeof(*j_obj));
-  j_obj->hash_func = hash_func;
-  j_obj->load_factor = load_factor;
-  j_obj->capacity = init_cap;
-  j_obj->entries = malloc(sizeof(*j_obj->entries) * j_obj->capacity);
-  memset(j_obj->entries, 0, sizeof(*j_obj->entries) * j_obj->capacity);
-  return j_obj;
+    load_factor = 80;
+
+  obj->hasher.hash_func = hash_func;
+  obj->hasher.hash_func_userdata = hash_func_userdata;
+  obj->load_factor = load_factor;
+  obj->capacity = init_cap;
+  obj->entries = (jsonKeyValuePair *)J_MALLOC(
+      allocator_ctx, sizeof(*obj->entries) * obj->capacity);
+  if (obj->entries == NULL) {
+    return JSON_ERROR_OUT_OF_MEMORY;
+  }
+  memset(obj->entries, 0, sizeof(*obj->entries) * obj->capacity);
+  return JSON_STATUS_OK;
 }
-// char *key;
-// jsonElement *element;
-jsonKeyValuePair *json_key_value_pair_new(char *key, jsonElement *value) {
-  jsonKeyValuePair *kv_pair = malloc(sizeof(*kv_pair));
-  kv_pair->key = strdup(key);
+
+jsonKeyValuePair *json_object_get(jsonObject *object, const char *key) {
+  hash_t hash =
+      object->hasher.hash_func(key, object->hasher.hash_func_userdata);
+  size_t idx = hash % object->capacity;
+
+  jsonKeyValuePair *entries = object->entries;
+  size_t entries_capacity = object->capacity;
+
+  size_t n_iters = 0;
+
+  while (entries[idx].hash != hash && n_iters <= entries_capacity) {
+    if (entries[idx].key != NULL) {
+      LOG_DEBUG("%s\n", entries[idx].key);
+    }
+    idx++;
+    n_iters++;
+    idx = idx % entries_capacity;
+  }
+  if (n_iters > entries_capacity) {
+    return NULL;
+  }
+  return (entries + idx);
+}
+
+jsonStatus json_object_append_key_value_pair(jsonObject *object,
+                                             const jsonKeyValuePair *kv_pair,
+                                             opaque_ptr_t allocator_ctx) {
+  J_UNUSED(allocator_ctx);
+
+  const char *key = kv_pair->key;
+  const hash_t hash =
+      object->hasher.hash_func(key, object->hasher.hash_func_userdata);
+  const size_t cap = object->capacity;
+  const size_t index = hash % cap;
+
+  if (json_object_is_resize_required(object)) {
+    jsonStatus json_status =
+        json_object_resize(object, object->capacity * 2, allocator_ctx);
+    if (json_status != JSON_STATUS_OK) {
+      assert(0 && "unreachable for now: remove it please!");
+      return json_status;
+    }
+  }
+  json_object_try_insert_kv_pair(object, kv_pair, index);
+  return JSON_STATUS_OK;
+}
+
+// note(shahzad): if i do wraparound_idx = idx+1 and iter wraparound then
+// i have to introduce conditionals to check if the first position is empty
+// if do wraparound_idx = idx-1 and iter idx then it will go in infinite loop
+// if idx is 0 ;(
+static void json_object_try_insert_kv_pair(jsonObject *object,
+                                           const jsonKeyValuePair *kv_pair,
+                                           size_t preferred_position) {
+  jsonKeyValuePair *entries = object->entries;
+  size_t entries_capacity = object->capacity;
+
+  size_t idx = preferred_position;
+  assert(idx < object->capacity);
+
+  size_t n_iters = 0;
+
+  while ((entries + idx)->key != NULL && n_iters <= entries_capacity) {
+    idx++;
+    n_iters++;
+    idx = idx % entries_capacity;
+  }
+  assert(n_iters <= entries_capacity);
+  *(entries + idx) = *kv_pair;
+  object->n_entries++;
+}
+
+// we have to impl this shit
+jsonStatus json_object_resize(jsonObject *obj, size_t new_capacity,
+                              opaque_ptr_t allocator_ctx) {
+  J_UNUSED(allocator_ctx);
+  J_UNUSED(obj);
+  const jsonObject *old_json_object = obj;
+  jsonObject new_object = {0};
+  jsonStatus ret =
+      json_object_new(&new_object, new_capacity, old_json_object->load_factor,
+                      old_json_object->hasher.hash_func,
+                      old_json_object->hasher.hash_func_userdata, NULL);
+
+  if (ret != JSON_STATUS_OK) {
+    return ret;
+  }
+
+  jsonObjectIter iter = json_object_iter_new(old_json_object);
+  const jsonKeyValuePair *kv_pair = NULL;
+  while ((kv_pair = json_object_iter_next(&iter))) {
+    const size_t idx = kv_pair->hash % new_capacity;
+    json_object_try_insert_kv_pair(&new_object, kv_pair, idx);
+  }
+
+  memcpy(obj, &new_object, sizeof(*obj));
+  return JSON_STATUS_OK;
+}
+
+bool json_object_is_resize_required(jsonObject *object) {
+  return object->capacity * object->load_factor < object->n_entries * 100;
+}
+
+void json_object_free(jsonObject *object) {
+  J_UNUSED(object);
+  assert(0 && "unimplemented");
+}
+
+jsonObjectIter json_object_iter_new(const jsonObject *obj) {
+  jsonObjectIter iter = {0};
+  iter.first = obj->entries;
+  iter.last = obj->entries + obj->capacity;
+  return iter;
+}
+const jsonKeyValuePair *json_object_iter_next(jsonObjectIter *iter) {
+  jsonKeyValuePair *kv_pair = NULL;
+  if (iter->current == NULL) {
+    iter->current = iter->first;
+    return iter->current;
+  } else if (iter->current == iter->last + 1) {
+    return NULL;
+  } else if (iter->first < iter->current && iter->current < iter->last) {
+    kv_pair = json_key_value_pair_get_first(iter->current, iter->last);
+    if (kv_pair == NULL) {
+      iter->current = NULL;
+      return NULL;
+    }
+    iter->current = kv_pair + 1;
+    return kv_pair;
+  } else {
+    assert(0 && "unreachable");
+  }
+}
+
+jsonStatus json_key_value_pair_new(jsonKeyValuePair *pair, char *key,
+                                   jsonElement *value,
+                                   opaque_ptr_t allocator_ctx) {
+  J_UNUSED(allocator_ctx);
+  jsonKeyValuePair *kv_pair = pair;
+  char *key_duped = NULL;
+  char *str_value = NULL; // need to dupe the value if string but variable decls
+                          // are not allowed in switch cases
+  jsonStatus status = cstrdup(allocator_ctx, key, &key_duped);
+  if (status != JSON_STATUS_OK) {
+    return status;
+  }
+  kv_pair->key = key_duped;
   kv_pair->element.kind = value->kind;
-  // this is a union so it doesn't matter if we do shit like this ig idk tho
+
   switch (value->kind) {
   case JSON_KIND_NUMBER:
-    kv_pair->element._int = value->_int;
+    kv_pair->element.as.number = value->as.number;
     break;
   case JSON_KIND_OBJEKT:
-    kv_pair->element._obj = value->_obj;
+    kv_pair->element.as.object = value->as.object;
     break;
   case JSON_KIND_STRING:
-    kv_pair->element._string = strdup(value->_string);
+    status = cstrdup(allocator_ctx, kv_pair->element.as.string, &str_value);
+    if (status != JSON_STATUS_OK) {
+      kv_pair->key = NULL;
+      J_FREE(allocator_ctx, key_duped);
+      return status;
+    }
+    kv_pair->element.as.string = str_value;
     break;
+  case JSON_KIND_ARRAY:
+    assert(0 && "unimplemented");
+  default:
+    assert(false && "unreachable");
   }
-  return kv_pair;
+  return JSON_STATUS_OK;
 }
-jsonKeyValuePair *json_key_value_pair_get_first(jsonKeyValuePair *start,
-                                                jsonKeyValuePair *end) {
+static jsonKeyValuePair *json_key_value_pair_get_first(jsonKeyValuePair *start,
+                                                       jsonKeyValuePair *end) {
   if (start == NULL || end == NULL || start > end) {
     return NULL;
   }
   jsonKeyValuePair *current = start;
   int found = 0;
-  for (int i = 0; i < (end - start) + 1; i++) {
+  int i = 0;
+  for (i = 0; i <= (end - start); i++) {
     if (current[i].key != NULL) {
       found = 1;
       break;
     }
-    i++;
   }
   if (found) {
-    return current;
+    return current + i;
   }
   return NULL;
 }
-// struct jsonObjectIter {
-//   jsonKeyValuePair *current;
-//   jsonKeyValuePair *next;
-// };
-jsonObjectIter json_object_iter_new(jsonObject *obj) {
-  jsonObjectIter iter = {0};
-  iter.current =
-      json_key_value_pair_get_first(obj->entries, obj->entries + obj->capacity);
-  iter.next = NULL;
-  iter.last = obj->entries + obj->capacity;
-  return iter;
-}
-const jsonKeyValuePair *json_object_iter_next(jsonObjectIter *iter) {
-  if (iter->current == NULL) {
-    return NULL;
+
+static jsonParserStatus json_parse_number(char *str_json, size_t *idx,
+                                          size_t json_len,
+                                          json_number *number) {
+  J_UNUSED(json_len);
+  size_t json_idx = *idx;
+  char *number_end = NULL;
+  json_idx += ltrim(str_json + json_idx);
+
+  // rust people will murder me for this shit
+  *number = strtod(str_json + json_idx, &number_end);
+
+  assert(number_end != NULL);
+
+  const ssize_t n_bytes = (number_end - (str_json + json_idx));
+  assert(n_bytes > 0 && n_bytes <= 20);
+
+  if (n_bytes <= 0) {
+    return (jsonParserStatus){.kind = JSON_INTERNAL_FAILURE};
   }
+  // LOG_DEBUG("n_bytes %ld\n", n_bytes);
+  json_idx += (size_t)n_bytes;
+  assert(!isdigit(str_json[json_idx]));
 
-  if (iter->next != NULL) {
-    iter->current = iter->next;
-  }
-  jsonKeyValuePair *json_kv = iter->current;
-  iter->next = json_key_value_pair_get_first(iter->current + 1, iter->last);
-  return json_kv;
-}
-
-// create another json instead of previous shit ig idk tho
-jsonParserStatus json_object_resize(jsonObject *obj, uint32_t new_capacity) {
-  uint32_t cap = obj->capacity;
-  uint32_t old_len = obj->len;
-  jsonKeyValuePair *new_map;
-  jsonKeyValuePair *old_map;
-  jsonKeyValuePair *entry;
-  if (new_capacity < cap) {
-    new_capacity = cap * 2;
-  }
-  new_map = malloc(sizeof(*new_map) * (new_capacity));
-  old_map = obj->entries;
-
-  obj->entries = new_map;
-  obj->capacity = new_capacity;
-  // reset all the shiit
-  obj->len = 0;
-
-  // json_object_append_key_value_pair(obj, jsonKeyValuePair * kv_pair,
-  //                                   void *user_data)
-  assert(new_map != NULL && "buy more ram lol");
+  *idx = json_idx;
 
   return (jsonParserStatus){.kind = JSON_OK};
 }
-jsonStatus json_object_insert_kv_pair(jsonObject *object,
-                                      jsonKeyValuePair *kv_pair,
-                                      uint32_t position, void *user_data) {
-  jsonKeyValuePair *current;
-  if (position > object->capacity) {
-    return JSON_STATUS_ERROR;
-  }
-  current = object->entries + position;
-  assert(current != NULL);
-  if (current->key == NULL) {
-    // not a pointer
-    *current = *kv_pair;
-    object->len++;
-  } else {
-    // pointer
-    while (current->next) {
-      current = current->next;
+
+static jsonParserStatus json_parse_string(char *str_json, size_t *idx,
+                                          size_t json_len, size_t *str_start,
+                                          size_t *str_end) {
+
+  char quote = 0;
+  size_t json_idx = *idx;
+  json_idx += ltrim(str_json + json_idx);
+
+  if (str_json[json_idx] == '"' || str_json[json_idx] == '\'' ||
+      str_json[json_idx] == '`')
+    quote = str_json[json_idx];
+  else
+    return (jsonParserStatus){.kind = JSON_INVALID_STRING};
+
+  next(json_idx);
+  *str_start = json_idx;
+
+  while (str_json[json_idx] && json_idx < json_len) {
+    if (str_json[json_idx] == '\n') {
+      return (jsonParserStatus){.kind = JSON_INVALID_STRING};
     }
-    current->next = kv_pair;
+    if (str_json[json_idx] == quote && str_json[json_idx - 1] != '\\') {
+      break;
+    }
+    next(json_idx);
+  }
+  *str_end = json_idx - 1;
+  next(json_idx);
+  *idx = json_idx;
+  return (jsonParserStatus){.kind = JSON_OK};
+}
+
+jsonParserStatus json_parse_object(jsonObject *object, char *str_json,
+                                   size_t *json_idx, size_t json_len,
+                                   opaque_ptr_t allocator_ctx) {
+  J_UNUSED(object);
+
+  size_t idx = *json_idx;
+  idx += ltrim(str_json);
+  if (str_json[idx] != '{') {
+    LOG_WARN("TODO: give row and column while returning error!\n");
+    return (jsonParserStatus){.kind = JSON_INVALID};
   }
 
+  next(idx);
+
+  while (str_json[idx] && idx < json_len) {
+    jsonKeyValuePair kv_pair = {0};
+    idx += ltrim(str_json + idx);
+
+    size_t key_start_idx = 0;
+    size_t key_end_idx = 0;
+
+    char *key = NULL;
+    size_t key_len = 0;
+    char *key_duped = NULL; // here cause kv_pair.key is const char *
+
+    jsonStatus json_status = JSON_STATUS_OK;
+    jsonParserStatus parser_status =
+        json_parse_key(str_json, &idx, json_len, &key_start_idx, &key_end_idx);
+
+    key = str_json + key_start_idx;
+    key_len = key_end_idx - key_start_idx + 1;
+
+    if (parser_status.kind != JSON_OK) {
+      return parser_status;
+    }
+
+    idx += ltrim(str_json + idx);
+    if (str_json[idx] != ':') {
+      json_object_free(object);
+      return (jsonParserStatus){.kind = JSON_NO_SEPERATOR};
+    }
+
+    json_status = strndup(allocator_ctx, key, key_len, &key_duped);
+    if (json_status != JSON_STATUS_OK) {
+      assert(json_status == JSON_ERROR_OUT_OF_MEMORY);
+      return (jsonParserStatus){.kind = JSON_INTERNAL_OUT_OF_MEMORY};
+    }
+    kv_pair.key = key_duped;
+    const hash_t hash = object->hasher.hash_func(
+        kv_pair.key, object->hasher.hash_func_userdata);
+    kv_pair.hash = hash;
+
+    next(idx);
+    idx += ltrim(str_json + idx);
+
+    parser_status = json_parse_value(&kv_pair.element, &object->hasher,
+                                     str_json, &idx, json_len, allocator_ctx);
+    if (parser_status.kind != JSON_OK) {
+      kv_pair.key = NULL;
+      J_FREE(allocator_ctx, key_duped);
+      json_object_free(object);
+      return parser_status;
+    }
+
+    switch (kv_pair.element.kind) {
+    case JSON_KIND_NUMBER: {
+      LOG_DEBUG("key: \"%s\", value: %lf\n", kv_pair.key,
+                kv_pair.element.as.number);
+      break;
+    }
+    case JSON_KIND_STRING: {
+      LOG_DEBUG("key: \"%s\", value: \"%s\"\n", kv_pair.key,
+                kv_pair.element.as.string);
+      break;
+    }
+    case JSON_KIND_OBJEKT:
+      LOG_DEBUG("key: \"%s\", value: [[ %s ]]\n", kv_pair.key, "jsonObject");
+      break;
+    case JSON_KIND_ARRAY:
+      LOG_DEBUG("key: \"%s\", value: [%s]\n", kv_pair.key, "jsonArray");
+      break;
+    default: {
+      assert(0 && "unimplemented\n");
+    }
+    }
+
+    json_status =
+        json_object_append_key_value_pair(object, &kv_pair, allocator_ctx);
+    if (json_status != JSON_STATUS_OK) {
+      assert(json_status == JSON_ERROR_OUT_OF_MEMORY);
+      J_FREE(allocator_context, key_duped);
+      assert(0);
+      json_element_free(&kv_pair.element);
+      json_object_free(object);
+      kv_pair.key = NULL;
+      return (jsonParserStatus){.kind = JSON_INTERNAL_OUT_OF_MEMORY};
+    }
+
+    idx += ltrim(str_json + idx);
+    *json_idx = idx;
+
+    if (str_json[idx] != ',' && str_json[idx] != '}') {
+      assert(0 && "free stuff here");
+      return (jsonParserStatus){.kind = JSON_INVALID};
+    }
+    if (str_json[idx] == '}') {
+      *json_idx = idx + 1;
+
+      return (jsonParserStatus){.kind = JSON_OK};
+    }
+    next(idx);
+  }
+  return (jsonParserStatus){.kind = JSON_OK};
+}
+
+jsonParserStatus json_parse_array(jsonArray *array, char *str_json,
+                                  size_t *json_idx, size_t json_len,
+                                  const jsonHash *hash_vtable,
+                                  opaque_ptr_t allocator_ctx) {
+
+  J_UNUSED(allocator_ctx);
+  size_t idx = *json_idx;
+  jsonParserStatus parser_status = {0};
+  jsonStatus json_status = JSON_STATUS_OK;
+  idx += ltrim(str_json + idx);
+  if (str_json[idx] != '[') {
+    return (jsonParserStatus){.kind = JSON_INVALID_ARRAY};
+  }
+  next(idx);
+  while (str_json[idx] != ']' && idx < json_len) {
+    idx += ltrim(str_json + idx);
+    jsonElement json_elem = {0};
+    parser_status = json_parse_value(&json_elem, hash_vtable, str_json, &idx,
+                                     json_len, allocator_ctx);
+    if (parser_status.kind != JSON_OK) {
+      return parser_status;
+    }
+    idx += ltrim(str_json + idx);
+    if (str_json[idx] != ',' && str_json[idx] != ']') {
+      json_element_free(&json_elem);
+      json_array_free(array);
+      return (jsonParserStatus){.kind = JSON_INVALID_ARRAY};
+    }
+
+    json_status = json_array_append(array, json_elem, allocator_ctx);
+    if (json_status != JSON_STATUS_OK) {
+      assert(json_status == JSON_ERROR_OUT_OF_MEMORY);
+      assert(0);
+      json_element_free(&json_elem);
+      json_array_free(array);
+      return (jsonParserStatus){.kind = JSON_INTERNAL_OUT_OF_MEMORY};
+    }
+    if (str_json[idx] == ']') {
+      *json_idx = idx + 1;
+      return (jsonParserStatus){.kind = JSON_OK};
+    }
+    // it can only be ',' now so we have to consume it and continue
+    next(idx);
+  }
+  return (jsonParserStatus){.kind = JSON_OK};
+}
+jsonParserStatus json_parse_value(jsonElement *json_elem,
+                                  const jsonHash *hash_vtable, char *str_json,
+                                  size_t *json_idx, size_t json_len,
+                                  opaque_ptr_t allocator_ctx) {
+  size_t idx = *json_idx;
+  jsonStatus json_status = JSON_STATUS_OK;
+  jsonParserStatus parser_status = {0};
+  switch (str_json[idx]) {
+  case '{': {
+    jsonObject value_object = {0};
+    json_status =
+        json_object_new(&value_object, 8, 80, hash_vtable->hash_func,
+                        hash_vtable->hash_func_userdata, allocator_ctx);
+    if (json_status != JSON_STATUS_OK) {
+      assert(json_status == JSON_ERROR_OUT_OF_MEMORY);
+      return (jsonParserStatus){.kind = JSON_INTERNAL_OUT_OF_MEMORY};
+    }
+    parser_status =
+        json_parse_object(&value_object, str_json, &idx, json_len, NULL);
+
+    if (parser_status.kind != JSON_OK) {
+      assert(0 && "free da memory in here\n");
+      return parser_status;
+    }
+
+    json_elem->kind = JSON_KIND_OBJEKT;
+    box(allocator_ctx, &value_object, (void **)&json_elem->as.object,
+        sizeof(value_object));
+    break;
+  }
+
+  case '[': {
+    jsonArray array = {0};
+    json_status = json_array_new(&array, 4, allocator_ctx);
+    if (json_status != JSON_STATUS_OK) {
+      assert(json_status == JSON_ERROR_OUT_OF_MEMORY);
+      assert(0 && "free da memory in here\n");
+      return (jsonParserStatus){.kind = JSON_INTERNAL_OUT_OF_MEMORY};
+    }
+    parser_status = json_parse_array(&array, str_json, &idx, json_len,
+                                     hash_vtable, allocator_ctx);
+    if (parser_status.kind != JSON_OK) {
+      return parser_status;
+    }
+    json_elem->kind = JSON_KIND_ARRAY;
+    box(allocator_ctx, &array, (void **)&json_elem->as.array,
+        sizeof(*json_elem->as.array));
+    break;
+  }
+
+  case '`':
+  case '"':
+  case '\'': {
+    size_t value_start_idx = SIZE_MAX;
+    size_t value_end_idx = SIZE_MAX;
+
+    parser_status = json_parse_string(str_json, &idx, json_len,
+                                      &value_start_idx, &value_end_idx);
+    if (parser_status.kind != JSON_OK) {
+      return parser_status;
+    }
+    assert(value_start_idx != SIZE_MAX && value_end_idx != SIZE_MAX &&
+           "unreachable");
+    json_elem->kind = JSON_KIND_STRING;
+    json_status =
+        strndup(allocator_ctx, str_json + value_start_idx,
+                value_end_idx - value_start_idx + 1, &json_elem->as.string);
+    if (json_status != JSON_STATUS_OK) {
+      assert(json_status == JSON_ERROR_OUT_OF_MEMORY);
+      return (jsonParserStatus){.kind = JSON_INTERNAL_OUT_OF_MEMORY};
+    }
+    break;
+  }
+
+  default: {
+    if (str_json[idx] > '0' && str_json[idx] < '9') {
+      json_number value = 0;
+      parser_status = json_parse_number(str_json, &idx, json_len, &value);
+      if (parser_status.kind != JSON_OK) {
+        return parser_status;
+      }
+      json_elem->kind = JSON_KIND_NUMBER;
+      json_elem->as.number = value;
+      break;
+    }
+    LOG_ERROR("unexpected token while parsing: %c\n", str_json[idx]);
+    assert(0 && "unreachable");
+  }
+  }
+  *json_idx = idx;
+  return (jsonParserStatus){.kind = JSON_OK};
+}
+jsonParserStatus json_from_string(jsonObject *object, char *json_start,
+                                  size_t json_len, opaque_ptr_t allocator_ctx) {
+  size_t idx = 0;
+  return json_parse_object(object, json_start, &idx, json_len, allocator_ctx);
+}
+
+jsonStatus json_array_new(struct jsonArray *array, size_t capacity,
+                          opaque_ptr_t allocator_ctx) {
+  J_UNUSED(allocator_ctx);
+  array->capacity = capacity;
+  array->elems = (jsonElement *)J_MALLOC(ctx, capacity * sizeof(*array->elems));
+  if (array->elems == NULL) {
+    return JSON_ERROR_OUT_OF_MEMORY;
+  }
+  array->len = 0;
   return JSON_STATUS_OK;
 }
-// TODO: idk what i did but need to fix this
-// takes ownership
-jsonStatus json_object_append_key_value_pair(jsonObject *object,
-                                             jsonKeyValuePair *kv_pair,
-                                             void *user_data) {
-  if (((float)object->len / (float)object->capacity) == 0.75) {
-    json_object_resize(object, object->capacity * 2);
-  }
-  char *key = kv_pair->key;
-  void *value = &kv_pair->element;
-  hash_t hash = object->hash_func(key, user_data);
-  size_t cap = object->capacity;
-  uint32_t index = hash % cap;
-  return json_object_insert_kv_pair(object, kv_pair, index, user_data);
-}
-jsonParserStatus json_parse_value(char **json_start, char *json_end,
-                                  jsonElement **el) {
-  char *iter = *json_start;
-  if (isdigit(*iter)) {
-    errno = 0;
-    char *end = NULL;
-    size_t number = strtol(iter, &end, 0);
-    if (errno == ERANGE)
-      return (jsonParserStatus){.kind = JSON_INVALID_NUMBER, .place = iter};
-    *el = malloc(sizeof(**el));
-    assert(*el != NULL);
-    (*el)->kind = JSON_KIND_NUMBER;
-    (*el)->_int = number;
-    iter = end;
-    *json_start = iter;
-    return (jsonParserStatus){.kind = JSON_OK};
-  } else {
-    if (*iter == '"' || *iter == '\'' || *iter == '`') {
-      char *value;
-      jsonParserStatus ret = json_parse_string(json_start, json_end, &value);
-      if (ret.kind != JSON_OK) {
-        return ret;
-      }
-      *el = malloc(sizeof(**el));
-      (*el)->kind = JSON_KIND_STRING;
-      (*el)->_string = value;
-    }
-    if (*iter == '{') {
-      printf("parsing object again ig idk tho\n");
-      jsonParserStatus ret = json_parse_object(json_start, json_end, NULL);
-      (*el)->kind = JSON_KIND_OBJEKT;
-      memset(&(*el)->_obj, 0, sizeof((*el)->_obj));
-    }
-  }
-  return (jsonParserStatus){.kind = JSON_OK};
-}
-jsonParserStatus json_parse_string(char **str_json, char *json_end,
-                                   char **string) {
-  char *iter = *str_json;
-  char quote = 0;
-  if (*iter == '"' || *iter == '\'' || *iter == '`')
-    quote = *iter;
-  else
-    return (jsonParserStatus){.kind = JSON_INVALID_STRING, .place = iter};
-  if (quote == 0)
-    return (jsonParserStatus){.kind = JSON_INVALID, .place = iter};
-  next(iter);
-  while (*iter && iter < json_end) {
-    if (*iter == '\n') {
-      return (jsonParserStatus){.kind = JSON_INVALID_STRING, .place = iter};
-    }
-    if (*iter == quote && *(iter - 1) != '\\') {
-      break;
-    }
-    iter++;
-  }
-  next(iter);
-  // skipping the quotes
-  int key_len = iter - *str_json - 2;
-  *string = strndup(*str_json + 1, key_len);
-  *str_json = iter;
-  return (jsonParserStatus){.kind = JSON_OK};
-}
-/*doesn't need end (parses until finds closing bracket)*/
-jsonParserStatus json_parse_object(char **str_json, char *json_end,
-                                   jsonObject *object) {
-  char *iter = *str_json;
-  if (*iter != '{') {
-    return (jsonParserStatus){.kind = JSON_INVALID, .place = iter};
-  }
-  next(iter);
-  while (*iter && iter < json_end) {
-    iter = ltrim(iter);
-    if (*iter == '}') {
-      return (jsonParserStatus){.kind = JSON_OK};
-    }
-    char *key = NULL;
-    jsonParserStatus ret = json_parse_key(&iter, json_end, &key);
-    if (ret.kind != JSON_OK) {
+
+// we do not care about thread safety
+jsonStatus json_array_append(struct jsonArray *array, struct jsonElement elem,
+                             opaque_ptr_t allocator_ctx) {
+  if (array->len == array->capacity) {
+    jsonStatus ret =
+        json_array_resize(array, array->capacity * 2, allocator_ctx);
+    if (ret != JSON_STATUS_OK) {
+      assert(ret == JSON_ERROR_OUT_OF_MEMORY);
       return ret;
     }
-    iter = ltrim(iter);
-    if (*iter != ':') {
-      return (jsonParserStatus){.kind = JSON_NO_SEPERATOR, .place = iter};
-    }
-    next(iter);
-    iter = ltrim(iter);
-    jsonElement *el = NULL;
-    ret = json_parse_value(&iter, json_end, &el);
-    if (ret.kind != JSON_OK) {
-      return ret;
-    }
-    iter = ltrim(iter);
-    printf("key :%s\n", key);
-    if (el->kind == JSON_KIND_STRING) {
-      printf("value :%s\n", el->_string);
-    } else if (el->kind == JSON_KIND_NUMBER) {
-      printf("int value :%lu\n", el->_int);
-    }
-    if (*iter != ',' && *iter != '}') {
-      // means the json is invalid
-      return (jsonParserStatus){.kind = JSON_INVALID, .place = iter};
-    }
-    if (*iter == '}') {
-      *str_json = ++iter;
-      return (jsonParserStatus){.kind = JSON_OK};
-    }
-    next(iter);
   }
-  if (!(iter < json_end)) {
-    return (jsonParserStatus){.kind = JSON_EXHAUSTED, .place = *str_json};
-  }
-  return (jsonParserStatus){.kind = JSON_OK};
-}
-jsonParserStatus json_from_string(char *json_start, int json_len,
-                                  jsonObject *object) {
-  char *iter = json_start;
-  char *json_end = json_start + json_len;
-  while (iter < json_end) {
-    iter = ltrim(iter);
-    json_end = rtrim(json_start, json_end);
-    if (*iter != '{') {
-      return (jsonParserStatus){.kind = JSON_INVALID, .place = json_start};
-    }
-    jsonParserStatus ret = json_parse_object(&iter, json_end, NULL);
-    return ret;
-  }
-  return (jsonParserStatus){.kind = JSON_OK};
-}
-jsonObject *json_object_clone(jsonObject *j_obj) {
-  const jsonKeyValuePair *kv_pair = NULL;
-  jsonKeyValuePair *kv_pair_clone = NULL;
-  jsonObject *cloned_obj =
-      json_object_new(j_obj->capacity, j_obj->load_factor, j_obj->hash_func);
-  jsonObjectIter j_obj_iter = json_object_iter_new(j_obj);
-  // no need to check if kv_pair is NULL
-  while ((kv_pair = json_object_iter_next(&j_obj_iter))) {
-    switch (kv_pair->element.kind) {
-    case JSON_KIND_STRING:
-    case JSON_KIND_NUMBER:
-      kv_pair_clone = json_key_value_pair_new(kv_pair->key,
-                                              (jsonElement *)&kv_pair->element);
-      break;
-    case JSON_KIND_OBJEKT:
-      // custom shit cause we are cloning ykwim
-      kv_pair_clone->key = strdup(kv_pair->key);
-      kv_pair_clone->element._obj =
-          json_object_clone((jsonObject *)&kv_pair->element._obj);
-      assert(0 && "TODO: unimplemented");
-      break;
-    }
-    json_object_append_key_value_pair(cloned_obj,
-                                      (jsonKeyValuePair *)kv_pair_clone, NULL);
-  }
-  return cloned_obj;
+  array->elems[array->len] = elem;
+  array->len++;
+  return JSON_STATUS_OK;
 }
 
-char *ltrim(char *str) {
-  while (isspace(*str) && *str)
-    str++;
-  return str;
+jsonElement *json_array_get(struct jsonArray *array, size_t idx) {
+  assert(array->len > idx);
+  return &array->elems[idx];
 }
-/*end shoud not have null terminator ig idk*/
-char *rtrim(char *str, char *end) {
-  while (isspace(*end) && end > str) {
-    end--;
+jsonStatus json_array_resize(struct jsonArray *array, size_t new_capacity,
+                             opaque_ptr_t allocator_ctx) {
+  J_UNUSED(allocator_ctx);
+  array->capacity = new_capacity;
+  array->elems = (jsonElement *)J_REALLOC(
+      allocator_ctx, array->elems, array->capacity * sizeof(*array->elems));
+  if (array->elems == NULL) {
+    return JSON_ERROR_OUT_OF_MEMORY;
   }
-  return end;
+  return JSON_STATUS_OK;
 }
+jsonStatus json_array_remove_swap(struct jsonArray *array, size_t idx) {
+  J_UNUSED(array);
+  J_UNUSED(idx);
+  assert(0 && "unimplemented");
+}
+
+jsonStatus json_array_remove_ordered(struct jsonArray *array, size_t idx) {
+  J_UNUSED(array);
+  J_UNUSED(idx);
+  assert(0 && "unimplemented");
+}
+jsonStatus json_array_free(struct jsonArray *array) {
+  J_UNUSED(array);
+  assert(0 && "unimplemented");
+}
+
+jsonStatus json_element_free(jsonElement *element) {
+  J_UNUSED(element);
+  assert(0 && "unimplemented");
+}
+
+static size_t ltrim(char *start) {
+  size_t idx = 0;
+  while (isspace(start[idx]) && start[idx])
+    idx++;
+  return idx;
+}
+static jsonStatus strndup(opaque_ptr_t allocator_ctx, const char *cstr,
+                          size_t len, char **dest) {
+  J_UNUSED(allocator_ctx);
+  *dest = (char *)J_MALLOC(allocator_ctx, len + 1);
+  if (*dest == NULL) {
+    return JSON_ERROR_OUT_OF_MEMORY;
+  }
+  memcpy(*dest, cstr, len);
+  (*dest)[len] = 0;
+  return JSON_STATUS_OK;
+}
+
+// as it points to static function
+#undef cstrdup

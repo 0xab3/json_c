@@ -1,10 +1,11 @@
-
 {
-  "tesing" : 1234,
-  "tesing1" : "yeheboaiiis",
-  "tesing3" : {
-  "tesing2" : 1234,
-  "tesing5" : "yeheboaiiis",
-
-  }
+  "testing1": [
+    1,
+    2,
+    3,
+    4,
+    "bruh",
+    { "testin2": "man wtf man", "testing4": ["cyka", "blyaat"] },
+    ["this", "is", "a", "certified", "hood", "classic"]
+  ]
 }
