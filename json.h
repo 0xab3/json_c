@@ -100,7 +100,7 @@ struct jsonElement {
 };
 
 struct jsonKeyValuePair {
-  const char *key;
+  char *key;
   hash_t hash;
   struct jsonElement element;
 };
@@ -118,11 +118,14 @@ typedef struct jsonKeyValuePair jsonKeyValuePair;
 typedef struct jsonElement jsonElement;
 typedef struct jsonHash jsonHash;
 
+// object MUST be allocated using any allocator (it shouldn't be managed by the
+// stack)
 jsonStatus json_object_new(jsonObject *obj, size_t init_cap, size_t load_factor,
                            hash_func_t hash_func,
                            opaque_ptr_t hash_func_userdata,
                            opaque_ptr_t allocator_ctx) __nonnull((1));
-jsonKeyValuePair *json_object_get(jsonObject *object, const char *key) __nonnull((1,2));
+jsonKeyValuePair *json_object_get(jsonObject *object, const char *key)
+    __nonnull((1, 2));
 jsonStatus json_object_append_key_value_pair(jsonObject *object,
                                              const jsonKeyValuePair *kv_pair,
                                              opaque_ptr_t allocator_ctx)
@@ -130,11 +133,12 @@ jsonStatus json_object_append_key_value_pair(jsonObject *object,
 jsonStatus json_object_resize(jsonObject *obj, size_t new_capacity,
                               opaque_ptr_t allocator_ctx) __nonnull((1));
 
-bool json_object_is_resize_required(jsonObject *object) __nonnull((1));
-void json_object_free(jsonObject *object) __nonnull((1));
-jsonObjectIter json_object_iter_new(const jsonObject *obj) __nonnull((1));
-const jsonKeyValuePair *json_object_iter_next(jsonObjectIter *iter)
+bool json_object_is_resize_required(jsonObject *object) __nonnull((1))
+    __attribute__((pure));
+void json_object_free(jsonObject *object, opaque_ptr_t allocator_ctx)
     __nonnull((1));
+jsonObjectIter json_object_iter_new(const jsonObject *obj) __nonnull((1));
+jsonKeyValuePair *json_object_iter_next(jsonObjectIter *iter) __nonnull((1));
 
 jsonParserStatus json_parse_value(jsonElement *json_elem,
                                   const jsonHash *hash_vtable, char *str_json,
@@ -146,10 +150,10 @@ jsonParserStatus json_parse_array(jsonArray *array, char *str_json,
                                   opaque_ptr_t allocator_ctx);
 jsonParserStatus json_parse_object(jsonObject *object, char *str_json,
                                    size_t *json_idx, size_t json_len,
-                                   opaque_ptr_t allocator_ctx);
+                                   opaque_ptr_t allocator_ctx) __nonnull((1,2,3));
 jsonParserStatus json_from_string(jsonObject *object, char *json_start,
                                   size_t json_len, opaque_ptr_t allocator_ctx)
-    __nonnull((1,2));
+    __nonnull((1, 2));
 jsonStatus json_key_value_pair_new(jsonKeyValuePair *pair, char *key,
                                    jsonElement *value,
                                    opaque_ptr_t allocator_ctx)
@@ -160,16 +164,18 @@ jsonStatus json_array_new(struct jsonArray *array, size_t capacity,
 
 jsonStatus json_array_append(struct jsonArray *array, struct jsonElement elem,
                              opaque_ptr_t allocator_ctx) __nonnull((1));
-jsonElement * json_array_get(struct jsonArray *array, size_t idx) __nonnull((1));
+jsonElement *json_array_get(struct jsonArray *array, size_t idx) __nonnull((1));
 jsonStatus json_array_resize(struct jsonArray *array, size_t new_capacity,
                              opaque_ptr_t allocator_ctx) __nonnull((1));
 jsonStatus json_array_remove_swap(struct jsonArray *array, size_t idx)
     __nonnull((1));
 jsonStatus json_array_remove_ordered(struct jsonArray *array, size_t idx)
     __nonnull((1));
-jsonStatus json_array_free(struct jsonArray *array) __nonnull((1));
+void json_array_free(struct jsonArray *array, opaque_ptr_t allocator_ctx)
+    __nonnull((1));
 
-jsonStatus json_element_free(jsonElement *element) __nonnull((1));
+void json_element_free(jsonElement *element, opaque_ptr_t allocator_ctx)
+    __nonnull((1));
 
 // jsonObject *json_object_clone(jsonObject *j_obj);
 #endif

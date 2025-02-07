@@ -13,7 +13,8 @@
 
 #define json_parse_key json_parse_string
 
-static hash_t typical_hash_function(const char *key, void *user_data);
+static hash_t typical_hash_function(const char *key, void *user_data)
+    __attribute__((pure));
 static void json_object_try_insert_kv_pair(jsonObject *object,
                                            const jsonKeyValuePair *kv_pair,
                                            size_t preferred_position);
@@ -177,25 +178,34 @@ bool json_object_is_resize_required(jsonObject *object) {
   return object->capacity * object->load_factor < object->n_entries * 100;
 }
 
-void json_object_free(jsonObject *object) {
-  J_UNUSED(object);
-  assert(0 && "unimplemented");
+void json_object_free(jsonObject *object, opaque_ptr_t allocator_ctx) {
+  J_UNUSED(allocator_ctx);
+  jsonObjectIter iter = json_object_iter_new(object);
+  jsonKeyValuePair *kv_pair = NULL;
+  while ((kv_pair = json_object_iter_next(&iter))) {
+    J_FREE(allocator_ctx, kv_pair->key);
+    json_element_free(&kv_pair->element, NULL);
+  }
+  J_FREE(allocator_ctx, object->entries);
+  J_FREE(allocator_ctx, object);
 }
 
 jsonObjectIter json_object_iter_new(const jsonObject *obj) {
   jsonObjectIter iter = {0};
   iter.first = obj->entries;
-  iter.last = obj->entries + obj->capacity;
+  iter.last = obj->entries + obj->capacity - 1;
   return iter;
 }
-const jsonKeyValuePair *json_object_iter_next(jsonObjectIter *iter) {
+jsonKeyValuePair *json_object_iter_next(jsonObjectIter *iter) {
   jsonKeyValuePair *kv_pair = NULL;
   if (iter->current == NULL) {
-    iter->current = iter->first;
-    return iter->current;
-  } else if (iter->current == iter->last + 1) {
-    return NULL;
-  } else if (iter->first < iter->current && iter->current < iter->last) {
+    kv_pair = json_key_value_pair_get_first(iter->first, iter->last);
+    if (kv_pair == NULL) {
+      return NULL;
+    }
+    iter->current = kv_pair + 1;
+    return kv_pair;
+  } else if (iter->first < iter->current && iter->current <= iter->last) {
     kv_pair = json_key_value_pair_get_first(iter->current, iter->last);
     if (kv_pair == NULL) {
       iter->current = NULL;
@@ -203,7 +213,12 @@ const jsonKeyValuePair *json_object_iter_next(jsonObjectIter *iter) {
     }
     iter->current = kv_pair + 1;
     return kv_pair;
+  } else if (iter->current > iter->last) {
+    iter->current = NULL;
+    return NULL;
   } else {
+    LOG_DEBUG("unreachable: first: %p current:%p last:%p\n",
+              (void *)iter->first, (void *)iter->current, (void *)iter->last);
     assert(0 && "unreachable");
   }
 }
@@ -261,6 +276,7 @@ static jsonKeyValuePair *json_key_value_pair_get_first(jsonKeyValuePair *start,
     }
   }
   if (found) {
+    assert(current[i].key != NULL);
     return current + i;
   }
   return NULL;
@@ -328,8 +344,6 @@ static jsonParserStatus json_parse_string(char *str_json, size_t *idx,
 jsonParserStatus json_parse_object(jsonObject *object, char *str_json,
                                    size_t *json_idx, size_t json_len,
                                    opaque_ptr_t allocator_ctx) {
-  J_UNUSED(object);
-
   size_t idx = *json_idx;
   idx += ltrim(str_json);
   if (str_json[idx] != '{') {
@@ -363,7 +377,7 @@ jsonParserStatus json_parse_object(jsonObject *object, char *str_json,
 
     idx += ltrim(str_json + idx);
     if (str_json[idx] != ':') {
-      json_object_free(object);
+      json_object_free(object, allocator_ctx);
       return (jsonParserStatus){.kind = JSON_NO_SEPERATOR};
     }
 
@@ -385,7 +399,7 @@ jsonParserStatus json_parse_object(jsonObject *object, char *str_json,
     if (parser_status.kind != JSON_OK) {
       kv_pair.key = NULL;
       J_FREE(allocator_ctx, key_duped);
-      json_object_free(object);
+      json_object_free(object, allocator_ctx);
       return parser_status;
     }
 
@@ -395,8 +409,8 @@ jsonParserStatus json_parse_object(jsonObject *object, char *str_json,
       assert(json_status == JSON_ERROR_OUT_OF_MEMORY);
       J_FREE(allocator_context, key_duped);
       assert(0);
-      json_element_free(&kv_pair.element);
-      json_object_free(object);
+      json_element_free(&kv_pair.element, NULL);
+      json_object_free(object, allocator_ctx);
       kv_pair.key = NULL;
       return (jsonParserStatus){.kind = JSON_INTERNAL_OUT_OF_MEMORY};
     }
@@ -449,8 +463,8 @@ jsonParserStatus json_parse_array(jsonArray *array, char *str_json,
                 str_json + idx - 10);
       LOG_ERROR("unexpected token while parsing: %*c%c\n", 10, ' ', '^');
       assert(0);
-      json_element_free(&json_elem);
-      json_array_free(array);
+      json_element_free(&json_elem, NULL);
+      json_array_free(array, NULL);
       return (jsonParserStatus){.kind = JSON_INVALID_ARRAY};
     }
 
@@ -458,8 +472,8 @@ jsonParserStatus json_parse_array(jsonArray *array, char *str_json,
     if (json_status != JSON_STATUS_OK) {
       assert(json_status == JSON_ERROR_OUT_OF_MEMORY);
       assert(0);
-      json_element_free(&json_elem);
-      json_array_free(array);
+      json_element_free(&json_elem, NULL);
+      json_array_free(array, NULL);
       return (jsonParserStatus){.kind = JSON_INTERNAL_OUT_OF_MEMORY};
     }
     if (str_json[idx] == ']') {
@@ -627,14 +641,37 @@ jsonStatus json_array_remove_ordered(struct jsonArray *array, size_t idx) {
   J_UNUSED(idx);
   assert(0 && "unimplemented");
 }
-jsonStatus json_array_free(struct jsonArray *array) {
-  J_UNUSED(array);
-  assert(0 && "unimplemented");
+void json_array_free(struct jsonArray *array, opaque_ptr_t allocator_ctx) {
+  J_UNUSED(allocator_ctx);
+  for (size_t i = 0; i < array->len; i++) {
+    json_element_free(&array->elems[i], allocator_ctx);
+  }
+  J_FREE(allocator_ctx, array->elems);
+  J_FREE(allocator_ctx, array);
 }
 
-jsonStatus json_element_free(jsonElement *element) {
-  J_UNUSED(element);
-  assert(0 && "unimplemented");
+void json_element_free(jsonElement *element, opaque_ptr_t allocator_ctx) {
+  switch (element->kind) {
+  case JSON_KIND_STRING: {
+    J_FREE(allocator_ctx, element->as.string);
+    break;
+  }
+  case JSON_KIND_ARRAY: {
+    json_array_free(element->as.array, allocator_ctx);
+    break;
+  }
+
+  case JSON_KIND_OBJEKT: {
+    json_object_free(element->as.object, allocator_ctx);
+    break;
+  }
+  case JSON_KIND_NUMBER: {
+    // we not allocating this shit
+    break;
+  }
+  default:
+    assert(0 && "unreachable");
+  }
 }
 
 static size_t ltrim(char *start) {
