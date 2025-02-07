@@ -88,9 +88,6 @@ jsonKeyValuePair *json_object_get(jsonObject *object, const char *key) {
   size_t n_iters = 0;
 
   while (entries[idx].hash != hash && n_iters <= entries_capacity) {
-    if (entries[idx].key != NULL) {
-      LOG_DEBUG("%s\n", entries[idx].key);
-    }
     idx++;
     n_iters++;
     idx = idx % entries_capacity;
@@ -283,12 +280,11 @@ static jsonParserStatus json_parse_number(char *str_json, size_t *idx,
   assert(number_end != NULL);
 
   const ssize_t n_bytes = (number_end - (str_json + json_idx));
-  assert(n_bytes > 0 && n_bytes <= 20);
+  assert(n_bytes > 0 && n_bytes <= 21);
 
   if (n_bytes <= 0) {
     return (jsonParserStatus){.kind = JSON_INTERNAL_FAILURE};
   }
-  // LOG_DEBUG("n_bytes %ld\n", n_bytes);
   json_idx += (size_t)n_bytes;
   assert(!isdigit(str_json[json_idx]));
 
@@ -393,28 +389,6 @@ jsonParserStatus json_parse_object(jsonObject *object, char *str_json,
       return parser_status;
     }
 
-    switch (kv_pair.element.kind) {
-    case JSON_KIND_NUMBER: {
-      LOG_DEBUG("key: \"%s\", value: %lf\n", kv_pair.key,
-                kv_pair.element.as.number);
-      break;
-    }
-    case JSON_KIND_STRING: {
-      LOG_DEBUG("key: \"%s\", value: \"%s\"\n", kv_pair.key,
-                kv_pair.element.as.string);
-      break;
-    }
-    case JSON_KIND_OBJEKT:
-      LOG_DEBUG("key: \"%s\", value: [[ %s ]]\n", kv_pair.key, "jsonObject");
-      break;
-    case JSON_KIND_ARRAY:
-      LOG_DEBUG("key: \"%s\", value: [%s]\n", kv_pair.key, "jsonArray");
-      break;
-    default: {
-      assert(0 && "unimplemented\n");
-    }
-    }
-
     json_status =
         json_object_append_key_value_pair(object, &kv_pair, allocator_ctx);
     if (json_status != JSON_STATUS_OK) {
@@ -431,6 +405,9 @@ jsonParserStatus json_parse_object(jsonObject *object, char *str_json,
     *json_idx = idx;
 
     if (str_json[idx] != ',' && str_json[idx] != '}') {
+      LOG_ERROR("unexpected token while parsing: %.*s\n", 50,
+                str_json + idx - 10);
+      LOG_ERROR("unexpected token while parsing: %*c%c\n", 10, ' ', '^');
       assert(0 && "free stuff here");
       return (jsonParserStatus){.kind = JSON_INVALID};
     }
@@ -468,6 +445,10 @@ jsonParserStatus json_parse_array(jsonArray *array, char *str_json,
     }
     idx += ltrim(str_json + idx);
     if (str_json[idx] != ',' && str_json[idx] != ']') {
+      LOG_ERROR("unexpected token while parsing: %.*s\n", 50,
+                str_json + idx - 10);
+      LOG_ERROR("unexpected token while parsing: %*c%c\n", 10, ' ', '^');
+      assert(0);
       json_element_free(&json_elem);
       json_array_free(array);
       return (jsonParserStatus){.kind = JSON_INVALID_ARRAY};
@@ -565,7 +546,8 @@ jsonParserStatus json_parse_value(jsonElement *json_elem,
   }
 
   default: {
-    if (str_json[idx] > '0' && str_json[idx] < '9') {
+    if (str_json[idx] == '-' || str_json[idx] == '+' ||
+        (str_json[idx] >= '0' && str_json[idx] <= '9')) {
       json_number value = 0;
       parser_status = json_parse_number(str_json, &idx, json_len, &value);
       if (parser_status.kind != JSON_OK) {
@@ -575,7 +557,10 @@ jsonParserStatus json_parse_value(jsonElement *json_elem,
       json_elem->as.number = value;
       break;
     }
-    LOG_ERROR("unexpected token while parsing: %c\n", str_json[idx]);
+    LOG_ERROR("unexpected token while parsing: %.*s\n", 50,
+              str_json + idx - 10);
+    LOG_ERROR("unexpected token while parsing: %*c%c\n", 10, ' ', '^');
+
     assert(0 && "unreachable");
   }
   }
